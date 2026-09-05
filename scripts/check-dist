@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# solid-node-viewer - the browser viewer for solid-node models
+# Copyright (C) 2023-2026 Luis Henrique Cassis Fagundes
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# The release dry-run: build the source distribution and the wheel, install
+# the wheel into a throwaway environment outside the repository, and ask the
+# installed package to describe itself there. Nothing is uploaded; publishing
+# is the maintainer's explicit decision, never a side effect of building.
+
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+python="${PYTHON:-python3}"
+
+cd "$root"
+rm -rf dist
+"$python" -m build
+
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT
+
+"$python" -m venv "$scratch/venv"
+"$scratch/venv/bin/pip" install --quiet --upgrade pip
+"$scratch/venv/bin/pip" install --quiet dist/*.whl
+
+cd "$scratch"
+described="$("$scratch/venv/bin/solid-node-viewer" describe)"
+echo "$described"
+"$scratch/venv/bin/python" - "$described" <<'PY'
+import json, os, sys
+value = json.loads(sys.argv[1])
+assert os.path.isfile(value['path']), value
+assert os.path.isfile(value['index']), value
+assert isinstance(value['apiVersion'], int), value
+head = open(value['path']).read(600)
+assert 'AGPL-3.0-only' in head and 'Source:' in head, head
+print(f"check-dist: wheel installs clean and carries the bundle "
+      f"(API {value['apiVersion']}, version {value['version']}).")
+PY
+echo "check-dist: uploads nothing. Publishing waits for the maintainer's explicit go."

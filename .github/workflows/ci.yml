@@ -1,0 +1,81 @@
+name: CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  widget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: solid_node_viewer/widget/package-lock.json
+      - working-directory: solid_node_viewer/widget
+        run: npm ci
+      - working-directory: solid_node_viewer/widget
+        run: npm run typecheck
+      - working-directory: solid_node_viewer/widget
+        run: npm test
+      - working-directory: solid_node_viewer/widget
+        run: npm run build
+
+  app:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: solid_node_viewer/app/package-lock.json
+      - working-directory: solid_node_viewer/app
+        run: npm ci
+      - working-directory: solid_node_viewer/app
+        run: CI=true npm test -- --watchAll=false
+      - working-directory: solid_node_viewer/app
+        run: npm run build
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            solid_node_viewer/widget/package-lock.json
+            solid_node_viewer/app/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Build the frontends the suite photographs
+        run: |
+          (cd solid_node_viewer/widget && npm ci && npm run build)
+          (cd solid_node_viewer/app && npm ci && npm run build)
+      - name: Install the package with its browser
+        run: |
+          pip install -e ".[dev]"
+          playwright install --with-deps chromium
+      - run: python -m pytest
+
+  dist:
+    runs-on: ubuntu-latest
+    needs: [widget, app, python]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - name: Build and smoke the distributions without publishing
+        run: scripts/check-dist
