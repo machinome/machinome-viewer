@@ -1,0 +1,1479 @@
+/*
+ * machinome-viewer - the browser viewer for machinome models
+ * Copyright (C) 2023-2026 Luis Henrique Cassis Fagundes
+ * SPDX-License-Identifier: AGPL-3.0-only
+ */
+
+// The tick (`simulation/run.py`'s `class Run`, reproduced): admissions,
+// one propagation over the edges in program order, stops located inside
+// the tick with the group of inputs that push them, segments, and the
+// atomicity that makes a refused tick commit nothing at all.
+
+import { describe, expect, it } from 'vitest';
+import { Run } from './run';
+import type { StopRecord } from './run';
+import {
+  LandingInvariantError, loadProgram, refusalKind, StopInvariantError,
+} from './program';
+import type { LoadedProgram, RunDocument } from './program';
+import { nextAfter } from './jumps';
+import corpus from '../running-corpus.json';
+
+/** The next representable float below `value`. */
+const nextDown = (value: number): number => nextAfter(value, -Infinity);
+
+const LIMITS = {
+  crossing_tolerance: 1e-12, subdivisions: 64, bisection_rounds: 64,
+  max_crossings: 1000, agreement: 1e-9,
+};
+
+const input = (initial: number) => ({ kind: 'input', initial, domain: null });
+const coordinate = (initial: number) =>
+  ({ kind: 'coordinate', initial, unit: null, domain: null });
+
+function bench(spec: {
+  coordinates: Record<string, unknown>;
+  edges: unknown[];
+  spans?: Record<string, unknown>;
+  intermediates?: string[];
+  sources?: Record<string, string[]>;
+  instructions?: Record<string, unknown>;
+}): LoadedProgram {
+  const ids = Object.keys(spec.coordinates);
+  const inputs = ids.filter(
+    (id) => (spec.coordinates[id] as { kind: string }).kind === 'input');
+  return loadProgram({
+    format: 'machinome-export',
+    version: 5,
+    drivers: Object.fromEntries(inputs.map((id) => [id, {
+      default: 0, range: null, unit: null, dtype: null, scale: null,
+    }])),
+    instructions: spec.instructions ?? {},
+    program: {
+      identity: 'bench', clock: 'time',
+      coordinates: spec.coordinates,
+      intermediates: spec.intermediates ?? [],
+      edges: spec.edges,
+      spans: spec.spans ?? {},
+      sources: spec.sources ?? Object.fromEntries(
+        [...ids, ...(spec.intermediates ?? [])].map(
+          (id) => [id, inputs.includes(id) ? [id] : inputs])),
+      limits: { ...LIMITS },
+    },
+  } as unknown as RunDocument, 'bench://run');
+}
+
+const law = (needs: string[], gives: string[], expression: string,
+             description: string, affine = true) => ({
+  kind: 'law', needs, gives, description, stated_by: 'Bench',
+  expressions: [expression], affine: [affine], plans: [null],
+});
+
+describe('one pass over the edges in program order', () => {
+  it('propagates increments along a chain', () => {
+    const program = bench({
+      coordinates: {
+        crank: input(0), 'first.turn': coordinate(0),
+        'second.turn': coordinate(0),
+      },
+      edges: [
+        law(['crank'], ['first.turn'], '(2 * crank)', 'crank drives first'),
+        law(['first.turn'], ['second.turn'], '(-1.5 * first.turn)',
+            'first drives second'),
+      ],
+    });
+    const run = new Run(program, 0.05, null);
+    run.move('crank', { by: 10, duration: 0.05 });
+    run.advance();
+    expect(run.state()).toEqual({
+      crank: 10, 'first.turn': 20, 'second.turn': -30,
+    });
+  });
+
+  it('holds a value no edge determines', () => {
+    const program = bench({
+      coordinates: { crank: input(0), idle: coordinate(3) },
+      edges: [],
+      sources: { crank: ['crank'], idle: [] },
+    });
+    const run = new Run(program, 0.05, null);
+    run.move('crank', { by: 10, duration: 0.05 });
+    run.advance();
+    expect(run.state().idle).toBe(3);
+  });
+
+  it('refuses a conflict between two determinations, naming the relation',
+     () => {
+       const program = bench({
+         coordinates: {
+           crank: input(0), 'wheel.turn': coordinate(0),
+         },
+         edges: [
+           law(['crank'], ['wheel.turn'], 'crank', 'crank drives wheel'),
+           law(['crank'], ['wheel.turn'], '(2 * crank)',
+               'the other relation drives wheel'),
+         ],
+       });
+       const run = new Run(program, 0.05, null);
+       const command = run.move('crank', { by: 10, duration: 0.05 });
+       let message = '';
+       try {
+         run.advance();
+       } catch (error) {
+         message = String(error);
+       }
+       expect(message).toContain('the other relation drives wheel');
+       expect(message).toContain('wheel.turn');
+       expect(message).toContain('Bench');
+       // The tick committed nothing and the command that moved is refused.
+       expect(run.state()).toEqual({ crank: 0, 'wheel.turn': 0 });
+       expect(run.tick()).toBe(0);
+       expect(command.status).toBe('refused');
+     });
+
+  it('refuses a check whose prediction disagrees', () => {
+    const program = bench({
+      coordinates: {
+        crank: input(0), slot: coordinate(0), 'wheel.turn': coordinate(0),
+      },
+      edges: [
+        law(['crank'], ['wheel.turn'], 'crank', 'crank drives wheel'),
+        law(['crank'], ['slot'], '(3 * crank)', 'crank drives slot'),
+        {
+          kind: 'check', needs: ['slot', 'wheel.turn'], gives: [],
+          description: "the derived coordinate 'slot'", stated_by: 'Bench',
+          factors: [0.0, 1], constant: 0, slot: 'slot',
+        },
+      ],
+    });
+    const run = new Run(program, 0.05, null);
+    run.move('crank', { by: 10, duration: 0.05 });
+    expect(() => run.advance())
+      .toThrow(/the derived coordinate 'slot'|predicts an increment/);
+    expect(run.tick()).toBe(0);
+  });
+});
+
+describe('a declared bound is a physical stop', () => {
+  const ratchet = () => bench({
+    coordinates: { arbor: input(40), 'wheel.turn': coordinate(40) },
+    edges: [law(['arbor'], ['wheel.turn'], 'arbor', 'arbor drives wheel')],
+    spans: {
+      'wheel.turn': {
+        low: { expression: '(36 * floor((wheel.turn / 36)))' }, high: null,
+      },
+    },
+  });
+
+  it('commits the coordinate AT its bound and blocks the group', () => {
+    const run = new Run(ratchet(), 0.05, 64);
+    const command = run.move('arbor', { by: -20, duration: 0.2 });
+    run.advance();
+    // The last seated tooth is 36 degrees; the tick asked for -5.
+    expect(run.state()['wheel.turn']).toBe(36);
+    expect(command.status).toBe('blocked');
+    expect(command.admitted).toBeCloseTo(-4, 12);
+    const stops = run.stops();
+    expect(stops).toHaveLength(1);
+    expect(stops[0].coordinate).toBe('wheel.turn');
+    expect(stops[0].bound).toBe('low');
+    expect(stops[0].value).toBe(36);
+    expect(stops[0].inputs).toEqual(['arbor']);
+    expect(stops[0].t).toBeCloseTo(0.8, 12);
+  });
+
+  it('locates a stop behind a NON-affine edge by sampling and bisection',
+     () => {
+       const program = bench({
+         coordinates: { crank: input(0), 'wheel.turn': coordinate(0) },
+         edges: [law(['crank'], ['wheel.turn'], '(crank ^ 2)',
+                     'crank drives wheel', false)],
+         spans: { 'wheel.turn': { low: null, high: 4 } },
+       });
+       const run = new Run(program, 0.05, 64);
+       const command = run.move('crank', { by: 4, duration: 0.05 });
+       run.advance();
+       expect(run.state()['wheel.turn']).toBe(4);
+       // crank^2 reaches 4 at crank = 2, half way through the tick.
+       expect(run.stops()[0].t).toBeCloseTo(0.5, 9);
+       expect(command.status).toBe('blocked');
+       expect(command.admitted).toBeCloseTo(2, 9);
+     });
+
+  it('is free to move AWAY from a bound it already stands on', () => {
+    const run = new Run(ratchet(), 0.05, 64);
+    const command = run.move('arbor', { by: 10, duration: 0.05 });
+    run.advance();
+    expect(run.state()['wheel.turn']).toBe(50);
+    expect(command.status).toBe('completed');
+    expect(run.stops()).toHaveLength(0);
+  });
+
+  it('does not stop an input reaching it only through a disengaged law',
+     () => {
+       // `wheel.turn` is pushed by `shaft` only while the clutch is
+       // engaged; `sleeve` is what engages it, and is not pushing.
+       const program = bench({
+         coordinates: {
+           shaft: input(0), sleeve: input(0), 'wheel.turn': coordinate(0),
+         },
+         edges: [{
+           kind: 'law', needs: ['shaft', 'sleeve'], gives: ['wheel.turn'],
+           description: '(shaft, sleeve) drives wheel.turn',
+           stated_by: 'Bench',
+           expressions: ['(shaft * (sleeve > 0.5))'], affine: [true],
+           plans: [{
+             skeleton: '(shaft * _j0)',
+             jumps: [{
+               name: '_j0', primitive: '>', level: '(sleeve - 0.5)',
+               affine: true,
+             }],
+           }],
+         }],
+         spans: { 'wheel.turn': { low: null, high: 4 } },
+       });
+       const run = new Run(program, 0.05, 64);
+       const turning = run.move('shaft', { by: 10, duration: 0.05 });
+       const engaging = run.move('sleeve', { by: 0.2, duration: 0.05 });
+       run.advance();
+       // The clutch is open for the whole tick, so the wheel never moves
+       // and neither command is blocked.
+       expect(run.state()['wheel.turn']).toBe(0);
+       expect(turning.status).toBe('completed');
+       expect(engaging.status).toBe('completed');
+     });
+});
+
+describe('the segment loop and atomicity', () => {
+  const twoStops = () => bench({
+    coordinates: {
+      lever_in: input(0), steer: input(0),
+      'a.turn': coordinate(0), 'b.turn': coordinate(0),
+    },
+    edges: [
+      law(['lever_in'], ['a.turn'], 'lever_in', 'lever drives a'),
+      law(['steer'], ['b.turn'], 'steer', 'steer drives b'),
+    ],
+    spans: {
+      'a.turn': { low: null, high: 1 },
+      'b.turn': { low: null, high: 3 },
+    },
+  });
+
+  it('takes two stops at two fractions of one tick', () => {
+    const run = new Run(twoStops(), 0.05, 64);
+    const first = run.move('lever_in', { by: 4, duration: 0.05 });
+    const second = run.move('steer', { by: 6, duration: 0.05 });
+    run.advance();
+    expect(run.state()['a.turn']).toBe(1);
+    expect(run.state()['b.turn']).toBe(3);
+    expect(first.status).toBe('blocked');
+    expect(second.status).toBe('blocked');
+    const stops = run.stops();
+    expect(stops.map((one) => one.coordinate)).toEqual(['a.turn', 'b.turn']);
+    expect(stops[0].t).toBeCloseTo(0.25, 12);
+    expect(stops[1].t).toBeCloseTo(0.5, 12);
+  });
+
+  it('maps a crossing back to the fraction of the TICK across a segment',
+     () => {
+       // A fold and a stop in one tick: the crossing is located inside
+       // the segment before the stop and recorded at its fraction of the
+       // whole tick.
+       const program = bench({
+         coordinates: { crank: input(0), 'wheel.turn': coordinate(0) },
+         edges: [{
+           kind: 'law', needs: ['crank'], gives: ['wheel.turn'],
+           description: 'crank drives wheel.turn', stated_by: 'Bench',
+           expressions: ['(crank - floor(crank))'], affine: [true],
+           plans: [{
+             skeleton: '(crank - _j0)',
+             jumps: [{ name: '_j0', primitive: 'floor', level: 'crank',
+                       affine: true }],
+           }],
+         }],
+         spans: { 'wheel.turn': { low: null, high: 1.5 } },
+       });
+       const run = new Run(program, 0.05, 64);
+       run.move('crank', { by: 3, duration: 0.05 });
+       run.advance();
+       const crossings = run.crossings();
+       expect(crossings.length).toBeGreaterThan(0);
+       for (const crossing of crossings) {
+         expect(crossing.t).toBeGreaterThanOrEqual(0);
+         expect(crossing.t).toBeLessThanOrEqual(1);
+       }
+       const stops = run.stops();
+       expect(stops).toHaveLength(1);
+       // The crossing at t = 1/3 of the tick came before the stop.
+       expect(crossings[0].t).toBeCloseTo(1 / 3, 9);
+       expect(crossings[0].t).toBeLessThan(stops[0].t);
+     });
+
+  it('a tick that refuses in its second segment commits nothing at all',
+     () => {
+       const program = bench({
+         coordinates: {
+           lever_in: input(0), 'a.turn': coordinate(0),
+           'b.turn': coordinate(0),
+         },
+         edges: [
+           law(['lever_in'], ['a.turn'], 'lever_in', 'lever drives a'),
+           // Two relations disagree on `b` -- but only once `a` has
+           // stopped and the second segment runs at a different stretch.
+           law(['a.turn'], ['b.turn'], 'a.turn', 'a drives b'),
+           law(['lever_in'], ['b.turn'], '(2 * lever_in)',
+               'lever also drives b'),
+         ],
+         spans: { 'a.turn': { low: null, high: 1 } },
+       });
+       const run = new Run(program, 0.05, 64);
+       const command = run.move('lever_in', { by: 4, duration: 0.05 });
+       expect(() => run.advance()).toThrow();
+       expect(run.state())
+         .toEqual({ lever_in: 0, 'a.turn': 0, 'b.turn': 0 });
+       expect(run.tick()).toBe(0);
+       expect(command.status).toBe('refused');
+       expect(run.stops()).toHaveLength(0);
+       expect(run.crossings()).toHaveLength(0);
+     });
+});
+
+describe('state', () => {
+  const machine = () => bench({
+    coordinates: { crank: input(0), 'wheel.turn': coordinate(0) },
+    edges: [law(['crank'], ['wheel.turn'], '(2 * crank)', 'crank drives wheel')],
+  });
+
+  it('snapshots identity, dt, tick, bank and command records', () => {
+    const run = new Run(machine(), 0.05, 8);
+    run.move('crank', { by: 10, duration: 0.5 });
+    run.advance();
+    const state = run.snapshot();
+    expect(state.program).toBe('bench');
+    expect(state.dt).toBe(0.05);
+    expect(state.tick).toBe(1);
+    expect(state.bank).toEqual({ crank: 1, 'wheel.turn': 2 });
+    expect(state.commands).toHaveLength(1);
+  });
+
+  it('restores, cancelling live handles and rebuilding the table', () => {
+    const run = new Run(machine(), 0.05, 8);
+    run.move('crank', { by: 10, duration: 0.5 });
+    run.advance();
+    const state = run.snapshot();
+    run.advance();
+    run.advance();
+    const live = run.commands()[0];
+    run.restore(state);
+    expect(live.status).toBe('cancelled');
+    expect(run.tick()).toBe(1);
+    expect(run.state()).toEqual({ crank: 1, 'wheel.turn': 2 });
+    expect(run.crossings()).toHaveLength(0);
+    // And the rebuilt command goes on admitting the same travel.
+    run.advance();
+    expect(run.state().crank).toBe(2);
+  });
+
+  it('refuses a snapshot from another program before touching anything',
+     () => {
+       const run = new Run(machine(), 0.05, 8);
+       run.advance();
+       let message = '';
+       try {
+         run.restore({ program: 'elsewhere', dt: 0.05, tick: 0, bank: {},
+                       commands: [] });
+       } catch (error) {
+         message = String(error);
+       }
+       expect(message).toContain('elsewhere');
+       expect(message).toContain('bench');
+       expect(run.tick()).toBe(1);
+     });
+
+  it('refuses a snapshot taken at another dt', () => {
+    const run = new Run(machine(), 0.05, 8);
+    let message = '';
+    try {
+      run.restore({ program: 'bench', dt: 0.1, tick: 0, bank: {},
+                    commands: [] });
+    } catch (error) {
+      message = String(error);
+    }
+    expect(message).toContain('0.1');
+    expect(message).toContain('0.05');
+  });
+
+  it('resets to the initial snapshot', () => {
+    const run = new Run(machine(), 0.05, 8);
+    run.move('crank', { by: 10, duration: 0.5 });
+    run.advance();
+    run.advance();
+    run.reset();
+    expect(run.tick()).toBe(0);
+    expect(run.state()).toEqual({ crank: 0, 'wheel.turn': 0 });
+    expect(run.commands()).toHaveLength(0);
+  });
+
+  it('keeps a bounded ring, and none at all when none was asked for', () => {
+    const bounded = new Run(machine(), 0.05, 3);
+    for (let step = 0; step < 6; step += 1) bounded.advance();
+    expect(bounded.trajectory()).toHaveLength(3);
+    expect(bounded.trajectory()[0].tick).toBe(4);
+
+    const none = new Run(machine(), 0.05, null);
+    none.advance();
+    expect(none.trajectory()).toHaveLength(0);
+    expect(none.crossings()).toHaveLength(0);
+    expect(none.stops()).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------
+// A bound that READS OTHER COORDINATES (design D4-D6). Each bench below
+// reproduces a fixture of machinome's own
+// `tests/running_project/machine.py`, and every number is that
+// repository's `tests/test_running_stops.py`.
+// ---------------------------------------------------------------------
+
+const pinLift = (k: number) =>
+  `(5 - (5 * min(max(((key.travel - ${k}) / 5), 0.0), 1.0)))`;
+
+const CLEARED =
+  '((90 * (abs(p1.lift) <= 0.05)) * (abs(p2.lift) <= 0.05))';
+
+/** `Gate`: the lock's shape reduced to two pins. The plug may turn only
+ * while every lift stands inside the shear-line window. */
+function gate(captured = false): LoadedProgram {
+  return bench({
+    coordinates: {
+      feed: input(captured ? 20 : 10),
+      twist: input(0),
+      'key.travel': coordinate(captured ? 20 : 10),
+      'p1.lift': coordinate(captured ? 0 : 5),
+      'p2.lift': coordinate(captured ? 0 : 5),
+      'plug.turn': coordinate(0),
+    },
+    edges: [
+      law(['feed'], ['key.travel'], 'feed', 'feed drives key.travel'),
+      law(['twist'], ['plug.turn'], 'twist', 'twist drives plug.turn'),
+      law(['key.travel'], ['p1.lift'], pinLift(10),
+          'key.travel drives p1.lift', false),
+      law(['key.travel'], ['p2.lift'], pinLift(13),
+          'key.travel drives p2.lift', false),
+    ],
+    spans: captured ? {
+      'key.travel': { low: { expression: '(20 * (plug.turn > 0))' },
+                      high: 20.0 },
+      'plug.turn': { low: 0.0, high: { expression: CLEARED } },
+    } : {
+      'plug.turn': { low: 0.0, high: { expression: CLEARED } },
+    },
+    sources: {
+      feed: ['feed'], twist: ['twist'],
+      'key.travel': ['feed'], 'p1.lift': ['feed'], 'p2.lift': ['feed'],
+      'plug.turn': ['twist'],
+    },
+  });
+}
+
+function ticks(run: Run, count: number): void {
+  for (let at = 0; at < count; at += 1) run.advance();
+}
+
+describe('the Gate: a plug that turns only when its pins clear', () => {
+  it('does not turn while a pin crosses (the static-reads path)', () => {
+    const run = new Run(gate(), 0.1, 8);
+    const handle = run.move('twist', { by: 30, duration: 0.1 });
+    run.advance();
+
+    expect(run.state()['plug.turn']).toBe(0);
+    expect(run.state().twist).toBe(0);
+    expect(handle.status).toBe('blocked');
+    expect(handle.admitted).toBe(0);
+    expect(run.commands()).toEqual([]);
+    expect(run.stops()).toHaveLength(1);
+    const stop = run.stops()[0];
+    expect(stop.coordinate).toBe('plug.turn');
+    expect(stop.bound).toBe('high');
+    expect(stop.value).toBe(0);
+    expect(stop.t).toBe(0);
+    expect(stop.inputs).toEqual(['twist']);
+  });
+
+  it('turns once every pin clears', () => {
+    const run = new Run(gate(), 0.1, 8);
+    const seat = run.move('feed', { to: 20, duration: 0.4 });
+    ticks(run, 4);
+    expect(seat.status).toBe('completed');
+    expect(run.stops()).toEqual([]);
+
+    const handle = run.move('twist', { by: 30, duration: 0.1 });
+    run.advance();
+    expect(run.state()['plug.turn']).toBeCloseTo(30, 9);
+    expect(handle.status).toBe('completed');
+    expect(handle.admitted).toBeCloseTo(30, 9);
+    expect(run.stops()).toEqual([]);
+  });
+
+  it('admits insertion and refuses turning in one tick', () => {
+    const run = new Run(gate(), 0.1, 8);
+    const feed = run.move('feed', { by: 10, duration: 0.1 });
+    const turn = run.move('twist', { by: 30, duration: 0.1 });
+    run.advance();
+
+    expect(run.state()['key.travel']).toBeCloseTo(20, 9);
+    expect(run.state()['plug.turn']).toBe(0);
+    expect(feed.status).toBe('completed');
+    expect(feed.admitted).toBeCloseTo(10, 9);
+    expect(turn.status).toBe('blocked');
+    expect(turn.admitted).toBe(0);
+
+    const again = run.move('twist', { by: 30, duration: 0.1 });
+    run.advance();
+    expect(again.status).toBe('completed');
+    expect(run.state()['plug.turn']).toBeCloseTo(30, 9);
+  });
+
+  it('stops the key withdrawing from a turned plug (the sampled path)',
+     () => {
+    const run = new Run(gate(), 0.1, 8);
+    run.move('feed', { to: 20, duration: 0.4 });
+    ticks(run, 4);
+    run.move('twist', { by: 30, duration: 0.1 });
+    run.advance();
+    expect(run.state()['plug.turn']).toBeCloseTo(30, 9);
+    const seen = run.stops().length;
+
+    const handle = run.move('feed', { by: -5, duration: 0.1 });
+    run.advance();
+
+    // The plug stands where it stood; the KEY is stopped where the
+    // second pin leaves the window.
+    expect(run.state()['plug.turn']).toBeCloseTo(30, 9);
+    const travel = run.state()['key.travel'];
+    expect(travel).toBeGreaterThanOrEqual(17.95);
+    expect(travel).toBeLessThanOrEqual(17.95 + 5.0e-11);
+    expect(handle.status).toBe('blocked');
+    expect(handle.admitted).toBeCloseTo(travel - 20, 9);
+
+    const stop = run.stops()[seen];
+    expect(stop.coordinate).toBe('plug.turn');
+    expect(stop.bound).toBe('high');
+    // The bound EVALUATED at the committed state, not the 30 the
+    // coordinate holds.
+    expect(stop.value).toBe(90);
+    expect(stop.t).toBeCloseTo(0.41, 9);
+    expect(stop.inputs).toEqual(['feed']);
+  });
+
+  it('admits the same travel at any cadence', () => {
+    const found: [number, number, string][] = [];
+    for (const count of [1, 4, 40]) {
+      const run = new Run(gate(), 0.1, 64);
+      run.move('feed', { to: 20, duration: 0.4 });
+      ticks(run, 4);
+      run.move('twist', { by: 30, duration: 0.1 });
+      run.advance();
+      const handle = run.move('feed', { by: -5, duration: 0.1 * count });
+      ticks(run, count);
+      found.push([run.state()['key.travel'], handle.admitted, handle.status]);
+    }
+    for (const [travel, admitted, status] of found) {
+      expect(status).toBe('blocked');
+      expect(travel).toBeCloseTo(found[0][0], 9);
+      expect(admitted).toBeCloseTo(found[0][1], 9);
+    }
+  });
+
+  it('replays a constraint stop identically from a snapshot', () => {
+    const run = new Run(gate(), 0.1, 8);
+    run.move('feed', { to: 20, duration: 0.4 });
+    ticks(run, 4);
+    run.move('twist', { by: 30, duration: 0.1 });
+    run.advance();
+    const taken = run.snapshot();
+
+    const blocked = (): [number, number, StopRecord] => {
+      const handle = run.move('feed', { by: -5, duration: 0.1 });
+      run.advance();
+      const stops = run.stops();
+      return [run.state()['key.travel'], handle.admitted,
+              stops[stops.length - 1]];
+    };
+
+    const first = blocked();
+    run.restore(taken);
+    const second = blocked();
+    expect(first[0]).toBe(second[0]);
+    expect(first[1]).toBe(second[1]);
+    expect(first[2].coordinate).toBe(second[2].coordinate);
+    expect(first[2].value).toBe(second[2].value);
+    expect(first[2].t).toBe(second[2].t);
+    expect(first[2].inputs).toEqual(second[2].inputs);
+  });
+});
+
+describe('the Captured gate: the key held by the turned plug', () => {
+  it('stops the key at once', () => {
+    const run = new Run(gate(true), 0.1, 8);
+    run.move('twist', { by: 30, duration: 0.1 });
+    run.advance();
+    expect(run.state()['plug.turn']).toBeCloseTo(30, 9);
+    const seen = run.stops().length;
+
+    const handle = run.move('feed', { by: -5, duration: 0.1 });
+    run.advance();
+
+    expect(run.state()['key.travel']).toBe(20);
+    expect(handle.status).toBe('blocked');
+    expect(handle.admitted).toBe(0);
+    const stop = run.stops()[seen];
+    expect(stop.coordinate).toBe('key.travel');
+    expect(stop.bound).toBe('low');
+    expect(stop.value).toBe(20);
+    expect(stop.t).toBe(0);
+    expect(stop.inputs).toEqual(['feed']);
+  });
+
+  it('returns the plug and refuses the withdrawal in one tick', () => {
+    const run = new Run(gate(true), 0.1, 8);
+    run.move('twist', { by: 30, duration: 0.1 });
+    run.advance();
+
+    const back = run.move('twist', { by: -30, duration: 0.1 });
+    const out = run.move('feed', { by: -5, duration: 0.1 });
+    run.advance();
+
+    expect(run.state()['plug.turn']).toBeCloseTo(0, 9);
+    expect(back.status).toBe('completed');
+    expect(run.state()['key.travel']).toBe(20);
+    expect(out.status).toBe('blocked');
+    expect(out.admitted).toBe(0);
+
+    const again = run.move('feed', { by: -5, duration: 0.1 });
+    run.advance();
+    expect(again.status).toBe('completed');
+    expect(run.state()['key.travel']).toBeCloseTo(15, 9);
+  });
+});
+
+/** `PawlRatchet`: the last seated tooth, lifted out of the way by a
+ * second coordinate. The tooth is the COMMITTED arbor's and the pawl's
+ * lift is read along the tick's path. */
+function pawlRatchet(): LoadedProgram {
+  return bench({
+    coordinates: {
+      arbor: input(40), hoist: input(0),
+      'pawl.lift': coordinate(0), 'wheel.turn': coordinate(40),
+    },
+    edges: [
+      law(['arbor'], ['wheel.turn'], 'arbor', 'arbor drives wheel.turn'),
+      law(['hoist'], ['pawl.lift'], 'hoist', 'hoist drives pawl.lift'),
+    ],
+    spans: {
+      'wheel.turn': {
+        low: {
+          expression:
+            '((36 * floor((wheel.turn / 36))) - (1000 * (pawl.lift >= 1)))',
+        },
+        high: null,
+      },
+    },
+    sources: {
+      arbor: ['arbor'], hoist: ['hoist'],
+      'wheel.turn': ['arbor'], 'pawl.lift': ['hoist'],
+    },
+  });
+}
+
+describe('the PawlRatchet: a committed tooth and an along-path pawl', () => {
+  it('releases the reverse when the pawl clears early', () => {
+    const run = new Run(pawlRatchet(), 0.1, 8);
+    const arbor = run.move('arbor', { by: -10, duration: 0.1 });
+    run.move('hoist', { by: 10 / 3, duration: 0.1 });
+    run.advance();
+
+    expect(run.state()['wheel.turn']).toBeCloseTo(30, 9);
+    expect(arbor.status).toBe('completed');
+    expect(arbor.admitted).toBeCloseTo(-10, 9);
+    expect(run.stops()).toEqual([]);
+  });
+
+  it('does not when the pawl clears late', () => {
+    const run = new Run(pawlRatchet(), 0.1, 8);
+    const arbor = run.move('arbor', { by: -10, duration: 0.1 });
+    run.move('hoist', { by: 2.0, duration: 0.1 });
+    run.advance();
+
+    expect(run.state()['wheel.turn']).toBeCloseTo(36.0, 9);
+    expect(arbor.status).toBe('blocked');
+    expect(arbor.admitted).toBeCloseTo(-4.0, 9);
+    expect(run.stops()).toHaveLength(1);
+    const stop = run.stops()[0];
+    expect(stop.coordinate).toBe('wheel.turn');
+    expect(stop.bound).toBe('low');
+    expect(stop.value).toBe(36.0);
+    expect(stop.t).toBeCloseTo(0.4, 9);
+  });
+});
+
+describe('a quiet bound costs nothing', () => {
+  it('takes no sample when nothing the constraint depends on moves', () => {
+    const program = gate();
+    let evaluations = 0;
+    const nodeOf = program.nodeOf;
+    (program as { nodeOf: (text: string) => unknown }).nodeOf = (text) => {
+      if (text === CLEARED) evaluations += 1;
+      return nodeOf(text);
+    };
+    const run = new Run(program, 0.1, 8);
+    // `feed` moves the pins, which the bound reads: this tick samples.
+    run.move('feed', { by: 1, duration: 0.1 });
+    run.advance();
+    const sampled = evaluations;
+    expect(sampled).toBeGreaterThan(1);
+
+    // Nothing this constraint depends on moves now: `plug.turn` stands
+    // and so do both lifts, so `boundsNow` alone touches the
+    // expression -- and it does not, because a constraint side is never
+    // evaluated there.
+    evaluations = 0;
+    run.advance();
+    expect(evaluations).toBe(0);
+    expect(run.stops()).toEqual([]);
+  });
+
+  it('leaves a coordinate standing outside its bound free', () => {
+    // The plug is turned while the pins are clear, then the key is
+    // withdrawn far enough to close the window: `plug.turn` stands
+    // outside its (now zero) bound and is not dragged back.
+    const run = new Run(gate(), 0.1, 16);
+    run.move('feed', { to: 20, duration: 0.4 });
+    ticks(run, 4);
+    run.move('twist', { by: 30, duration: 0.1 });
+    run.advance();
+    const before = run.state()['plug.turn'];
+    run.move('feed', { by: -5, duration: 0.1 });
+    run.advance();
+    // Blocked where the window closes, and the plug has not moved.
+    expect(run.state()['plug.turn']).toBe(before);
+    // A second, unrelated tick moves nothing: the standing plug is free.
+    run.advance();
+    expect(run.state()['plug.turn']).toBe(before);
+  });
+});
+
+describe('one event carrying a numeric stop and a constraint stop', () => {
+  it('asserts the invariant after the whole event is committed', () => {
+    // `wheel.turn` carries a numeric low bound reached at the same
+    // fraction as `plug.turn`'s constraint: the numeric snap mutates
+    // `committed`, and the assertion must run after it (design D6).
+    const program = bench({
+      coordinates: {
+        feed: input(10), twist: input(0), spin: input(0),
+        'key.travel': coordinate(10),
+        'p1.lift': coordinate(5), 'p2.lift': coordinate(5),
+        'plug.turn': coordinate(0), 'wheel.turn': coordinate(0),
+      },
+      edges: [
+        law(['feed'], ['key.travel'], 'feed', 'feed drives key.travel'),
+        law(['twist'], ['plug.turn'], 'twist', 'twist drives plug.turn'),
+        law(['spin'], ['wheel.turn'], 'spin', 'spin drives wheel.turn'),
+        law(['key.travel'], ['p1.lift'], pinLift(10),
+            'key.travel drives p1.lift', false),
+        law(['key.travel'], ['p2.lift'], pinLift(13),
+            'key.travel drives p2.lift', false),
+      ],
+      spans: {
+        'plug.turn': { low: 0.0, high: { expression: CLEARED } },
+        'wheel.turn': { low: -5.0, high: null },
+      },
+      sources: {
+        feed: ['feed'], twist: ['twist'], spin: ['spin'],
+        'key.travel': ['feed'], 'p1.lift': ['feed'], 'p2.lift': ['feed'],
+        'plug.turn': ['twist'], 'wheel.turn': ['spin'],
+      },
+    });
+    const run = new Run(program, 0.1, 8);
+    // The plug is blocked at t = 0 (the pins are not cleared) and the
+    // wheel reaches its numeric low bound at t = 0 too, because it
+    // starts there.
+    const turn = run.move('twist', { by: 30, duration: 0.1 });
+    const spin = run.move('spin', { by: -10, duration: 0.1 });
+    run.advance();
+
+    expect(run.state()['plug.turn']).toBe(0);
+    expect(run.state()['wheel.turn']).toBe(-5);
+    expect(turn.status).toBe('blocked');
+    expect(spin.status).toBe('blocked');
+    const kinds = run.stops().map((stop) => `${stop.coordinate}:${stop.bound}`);
+    expect(kinds).toContain('plug.turn:high');
+    expect(kinds).toContain('wheel.turn:low');
+  });
+});
+
+describe('the sub-program pass is the segment arithmetic (design D4)', () => {
+  it('takes a jumping law inside the sub-program over the truncated path',
+     () => {
+    // `gate.lift` is driven by a law that JUMPS: it steps to 1 when the
+    // hoist passes 2. The bound reads `gate.lift`, so the level at each
+    // sample is one pass over that law's PLAN truncated at `t` -- the
+    // same arithmetic the segment is later committed by.
+    const program = bench({
+      coordinates: {
+        hoist: input(0), crank: input(0),
+        'gate.lift': coordinate(0), 'arm.turn': coordinate(0),
+      },
+      edges: [
+        {
+          kind: 'law', needs: ['hoist'], gives: ['gate.lift'],
+          description: 'hoist drives gate.lift', stated_by: 'Bench',
+          expressions: ['(hoist * (hoist >= 2))'], affine: [false],
+          plans: [{
+            skeleton: '(hoist * _j0)',
+            jumps: [{
+              name: '_j0', primitive: '>=', level: '(hoist - 2)',
+              affine: true,
+            }],
+          }],
+        },
+        law(['crank'], ['arm.turn'], 'crank', 'crank drives arm.turn'),
+      ],
+      spans: {
+        'arm.turn': { low: null, high: { expression: '(90 * (gate.lift < 1))' } },
+      },
+      sources: {
+        hoist: ['hoist'], crank: ['crank'],
+        'gate.lift': ['hoist'], 'arm.turn': ['crank'],
+      },
+    });
+    const run = new Run(program, 0.1, 8);
+    // The hoist crosses the surface at t = 0.5 of the tick, from which
+    // point `gate.lift` follows it; it reaches 1 at t = 0.75, which is
+    // where the arm's bound closes.
+    run.move('hoist', { by: 4, duration: 0.1 });
+    const turn = run.move('crank', { by: 90, duration: 0.1 });
+    run.advance();
+
+    expect(turn.status).toBe('blocked');
+    // The arm stopped at the fraction the PLAN's truncated path gives,
+    // not at either end of the stretch.
+    const stop = run.stops()[0];
+    expect(stop.coordinate).toBe('arm.turn');
+    expect(stop.bound).toBe('high');
+    expect(stop.t).toBeGreaterThan(0.74);
+    expect(stop.t).toBeLessThanOrEqual(0.75);
+    expect(run.state()['arm.turn']).toBeCloseTo(90 * stop.t, 9);
+  });
+
+  it('stops the input that carries the level outward and frees the one '
+     + 'that relieves it', () => {
+    // The plug stands turned with the key seated, and ONE tick moves
+    // the key out (which closes the window: outward) while an unrelated
+    // input runs. Only `feed` is in the group.
+    const run = new Run(gate(), 0.1, 16);
+    run.move('feed', { to: 20, duration: 0.4 });
+    ticks(run, 4);
+    run.move('twist', { by: 30, duration: 0.1 });
+    run.advance();
+
+    const out = run.move('feed', { by: -5, duration: 0.1 });
+    // `twist` moving the plug BACK relieves the high bound: level(1) is
+    // below level(0), so it is not stopped.
+    const back = run.move('twist', { by: -5, duration: 0.1 });
+    run.advance();
+
+    expect(out.status).toBe('blocked');
+    expect(back.status).toBe('completed');
+    expect(run.stops()[run.stops().length - 1].inputs).toEqual(['feed']);
+  });
+});
+
+// ---------------------------------------------------------------------
+// A law that READS THE COORDINATE IT DRIVES: the framework's own
+// `Clearing` and `StoppedClearing`, reproduced as benches (design D2,
+// D4, D5, tasks 5 and 6). Every number below is the framework's own --
+// `tests/running_project/machine.py`'s `GAP = 0.5`,
+// `STATION = (100.0, 500.0)`, the dial resting at 108 -- and the
+// published document for the same machine is in the conformance corpus.
+// ---------------------------------------------------------------------
+
+/** `missing_tooth`, published: the setter turns the dial directly, and
+ * the ring turns it only while the rack's station reaches it AND the
+ * dial is not already standing in its missing-tooth gap. */
+const CLEARING_EDGE = {
+  kind: 'law',
+  needs: ['setter', 'ring', 'wheel.turn'],
+  gives: ['wheel.turn'],
+  description: '(setter, ring, wheel.turn) drives wheel.turn',
+  stated_by: 'Clearing',
+  expressions: [
+    '(setter + ((ring * (floor(((ring - 100.0) / 400.0)) == 0)) * '
+    + '((((wheel.turn + 0.5) - (360.0 * floor(((wheel.turn + 0.5) '
+    + '/ 360.0)))) - 1.0) >= 0.0)))',
+  ],
+  affine: [true],
+  plans: [{
+    skeleton: '(setter + ((ring * _j1) * _j3))',
+    jumps: [
+      { name: '_j0', primitive: 'floor', level: '((ring - 100.0) / 400.0)',
+        affine: true },
+      { name: '_j1', primitive: '==', level: '(_j0 - 0)', affine: true },
+      { name: '_j2', primitive: 'floor',
+        level: '((wheel.turn + 0.5) / 360.0)', affine: true },
+      { name: '_j3', primitive: '>=',
+        level: '(((wheel.turn + 0.5) - (360.0 * _j2)) - 1.0)', affine: true },
+    ],
+  }],
+};
+
+const GAP = 0.5;
+
+function clearingRun(dt = 0.05, rest = 108, ringRest = 0,
+                     spec: Record<string, unknown> = {}): Run {
+  const program = bench({
+    coordinates: {
+      setter: input(0), ring: input(ringRest),
+      'wheel.turn': coordinate(rest),
+    },
+    edges: [CLEARING_EDGE],
+    sources: {
+      setter: ['setter'], ring: ['ring'], 'wheel.turn': ['ring', 'setter'],
+    },
+    ...spec,
+  });
+  return new Run(program, dt, 400);
+}
+
+/** Whether the published gate reads DISENGAGED at `value`, by this
+ * viewer's own arithmetic rather than by a tolerance. */
+function disengaged(value: number): boolean {
+  const shifted = value + GAP;
+  return shifted - 360 * Math.floor(shifted / 360) < 2 * GAP;
+}
+
+describe('a law that reads the coordinate it drives (tasks 6)', () => {
+  it('6.1 loads with the shape the framework publishes', () => {
+    const run = clearingRun();
+    const edge = run.state !== undefined
+      ? (run as unknown as { program: LoadedProgram }).program.edges[0]
+      : null;
+    expect(edge!.needs).toEqual(['setter', 'ring', 'wheel.turn']);
+    expect(edge!.gives).toEqual(['wheel.turn']);
+    expect(edge!.retained).toHaveLength(1);
+    expect(edge!.retained[0]!.own).toBe('wheel.turn');
+    expect(run.state()['wheel.turn']).toBe(108);
+  });
+
+  it('6.2 the dial clears to its gap and the RING RUNS ON', () => {
+    const run = clearingRun();
+    const command = run.move('ring', { by: 600, duration: 0.25 });
+    for (let tick = 0; tick < 8; tick += 1) run.advance();
+    const dial = run.state()['wheel.turn'];
+    // Within the band half-width of a full turn, in the sweep's own
+    // direction, at a value the published gate reads DISENGAGED.
+    expect(Math.abs(dial - 360)).toBeLessThanOrEqual(GAP);
+    expect(dial).toBeLessThan(360);
+    expect(disengaged(dial)).toBe(true);
+    // The ring completed its whole travel even so.
+    expect(run.state().ring).toBeCloseTo(600, 9);
+    expect(command.status).toBe('completed');
+    // One crossing, in the crossing record, and NO stop.
+    expect(run.crossings().filter(
+      (one) => one.coordinate === 'wheel.turn' && one.primitive === 'floor',
+    ).length).toBeGreaterThanOrEqual(1);
+    expect(run.stops()).toEqual([]);
+  });
+
+  it('6.3 a second and a third sweep move the dial by NOTHING -- the same '
+     + 'float, bit for bit', () => {
+    const run = clearingRun();
+    run.move('ring', { by: 600, duration: 0.25 });
+    for (let tick = 0; tick < 8; tick += 1) run.advance();
+    const cleared = run.state()['wheel.turn'];
+    for (const sweep of [2, 3]) {
+      const command = run.move('ring', { by: 600, duration: 0.25 });
+      for (let tick = 0; tick < 8; tick += 1) run.advance();
+      expect(Object.is(run.state()['wheel.turn'], cleared)).toBe(true);
+      expect(command.status).toBe('completed');
+      void sweep;
+    }
+    expect(run.stops()).toEqual([]);
+  });
+
+  it('6.4 swept BACKWARD from inside the station the dial ends on the '
+     + 'band\'s UPPER edge and does not move again', () => {
+    // The ring RESTS inside its station, so the approach itself turns
+    // nothing: the dial stands at 108 with the gate engaged.
+    const run = clearingRun(0.05, 108, 300);
+    run.move('ring', { by: -250, duration: 0.25 });
+    for (let tick = 0; tick < 8; tick += 1) run.advance();
+    const dial = run.state()['wheel.turn'];
+    expect(disengaged(dial)).toBe(true);
+    // The UPPER edge of the band, which is the first value BELOW `GAP`
+    // at which the gate disengages.
+    expect(dial).toBeLessThan(GAP);
+    expect(dial).toBeGreaterThan(GAP - 1e-12);
+    const stood = dial;
+    run.move('ring', { to: 300, duration: 0.1 });
+    for (let tick = 0; tick < 4; tick += 1) run.advance();
+    run.move('ring', { by: -250, duration: 0.25 });
+    for (let tick = 0; tick < 8; tick += 1) run.advance();
+    expect(Object.is(run.state()['wheel.turn'], stood)).toBe(true);
+  });
+
+  it('6.5 a dial standing EXACTLY at a band edge holds in the direction '
+     + 'that takes it deeper and turns in the one that leaves', () => {
+    // At `wheel.turn == 0.5` the gate's level is exactly zero: `>=`
+    // reads ENGAGED there, and rule (c) decides the piece by where the
+    // level GOES.
+    const forward = clearingRun(0.05, GAP, 200);
+    forward.move('ring', { by: 50, duration: 0.05 });
+    forward.advance();
+    // Leaving the band: the dial turns with the ring.
+    expect(forward.state()['wheel.turn']).toBe(GAP + 50);
+
+    const backward = clearingRun(0.05, GAP, 200);
+    const stood = backward.state()['wheel.turn'];
+    expect(stood).toBe(GAP);
+    backward.move('ring', { by: -50, duration: 0.05 });
+    backward.advance();
+    // Deeper into the band: the dial holds, bit for bit.
+    expect(Object.is(backward.state()['wheel.turn'], stood)).toBe(true);
+  });
+
+  it('6.6 the same sweep at one tick, twelve and two hundred and forty '
+     + 'agrees within the run\'s agreement window', () => {
+    const answers = [1, 12, 240].map((ticks) => {
+      const run = clearingRun(0.25 / ticks);
+      const command = run.move('ring', { by: 600, duration: 0.25 });
+      for (let tick = 0; tick < ticks * 4; tick += 1) run.advance();
+      expect(command.status).toBe('completed');
+      expect(run.stops()).toEqual([]);
+      return run.state()['wheel.turn'];
+    });
+    for (const answer of answers) {
+      expect(Math.abs(answer - answers[0]))
+        .toBeLessThanOrEqual(1e-9 * Math.max(1, Math.abs(answer)));
+      expect(disengaged(answer)).toBe(true);
+    }
+  });
+
+  it('6.7 a run state taken after a partial sweep and restored resumes '
+     + 'from the same float and reaches the same band edge', () => {
+    const run = clearingRun();
+    run.move('ring', { by: 600, duration: 0.25 });
+    run.advance();
+    run.advance();
+    const taken = run.snapshot();
+    const midway = run.state()['wheel.turn'];
+    for (let tick = 0; tick < 6; tick += 1) run.advance();
+    const reached = run.state()['wheel.turn'];
+
+    run.restore(taken);
+    expect(Object.is(run.state()['wheel.turn'], midway)).toBe(true);
+    for (let tick = 0; tick < 6; tick += 1) run.advance();
+    expect(Object.is(run.state()['wheel.turn'], reached)).toBe(true);
+  });
+
+  it('6.8 `StoppedClearing`: one segment reports BOTH a landing and a '
+     + 'bound on the same coordinate, and the BOUND wins', () => {
+    const program = bench({
+      coordinates: {
+        setter: input(0), ring: input(0), gauge_in: input(0),
+        'wheel.turn': coordinate(108), 'gauge.turn': coordinate(0),
+      },
+      edges: [
+        CLEARING_EDGE,
+        { kind: 'wiring', needs: ['gauge_in'], gives: ['gauge.turn'],
+          description: 'gauge_in drives gauge.turn', stated_by:
+          'StoppedClearing', factor: 1.0 },
+      ],
+      spans: {
+        'wheel.turn': { low: null, high: 400.0 },
+        'gauge.turn': { low: null, high: 40.0 },
+      },
+      sources: {
+        setter: ['setter'], ring: ['ring'], gauge_in: ['gauge_in'],
+        'wheel.turn': ['ring', 'setter'], 'gauge.turn': ['gauge_in'],
+      },
+    });
+    const run = new Run(program, 0.05, 400);
+    run.move('ring', { by: 600, duration: 0.25 });
+    run.move('gauge_in', { by: 100, duration: 0.25 });
+    run.move('setter', { by: 100, duration: 0.25 });
+    run.advance();
+    run.advance();
+    let seen = run.stops().length;
+    run.advance();
+
+    // The framework's own third tick, to the digit.
+    const bank = run.state();
+    expect(bank['wheel.turn']).toBe(400);
+    expect(bank['gauge.turn']).toBe(40);
+    expect(bank.ring).toBeCloseTo(341.1428571428571, 9);
+    expect(bank.setter).toBeCloseTo(56.85714285714286, 9);
+
+    const stops = run.stops().slice(seen);
+    expect(stops.map((one) => one.coordinate))
+      .toEqual(['gauge.turn', 'wheel.turn']);
+    expect(stops[0].t).toBe(0);
+    expect(stops[0].inputs).toEqual(['gauge_in']);
+    expect(stops[1].value).toBe(400);
+    expect(stops[1].t).toBeCloseTo(0.8428571428571429, 9);
+    expect(stops[1].inputs).toEqual(['ring', 'setter']);
+    seen = 0;
+  });
+});
+
+describe('what the run does with a landing (design D4, D5, tasks 5)', () => {
+  // A gate whose surface is NOT a float the tick's own arithmetic
+  // reproduces: the dial holds at `11.9`, and `value + delta` from a
+  // rest of `3.7` gives `11.899999999999999` -- one ulp BACK TOWARD the
+  // surface, which is the ENGAGED side of the gate. That ulp is the
+  // whole of what `landed` is for, so it is what these two pin.
+  const LOSSY_EDGE = {
+    kind: 'law',
+    needs: ['ring', 'wheel.turn'],
+    gives: ['wheel.turn'],
+    description: '(ring, wheel.turn) drives wheel.turn',
+    stated_by: 'Bench',
+    expressions: [
+      '(ring * (1.0 - ((floor((wheel.turn / 1.7)) - 7.0) >= 0.0)))',
+    ],
+    affine: [true],
+    plans: [{
+      skeleton: '(ring * (1.0 - _j1))',
+      jumps: [
+        { name: '_j0', primitive: 'floor', level: '(wheel.turn / 1.7)',
+          affine: true },
+        { name: '_j1', primitive: '>=', level: '(_j0 - 7.0)', affine: true },
+      ],
+    }],
+  };
+
+  it('5.2 applies the landing after the FULL-STRETCH pass, before the '
+     + 'bounds are examined', () => {
+    const program = bench({
+      coordinates: { ring: input(0), 'wheel.turn': coordinate(3.7) },
+      edges: [LOSSY_EDGE],
+      sources: { ring: ['ring'], 'wheel.turn': ['ring'] },
+    });
+    const run = new Run(program, 0.25, 400);
+    run.move('ring', { to: 100, duration: 0.25 });
+    run.advance();
+    // The float the WALK left it at, not the starting value plus the
+    // increment: `3.7 + (11.9 - 3.7)` is `11.899999999999999`, which
+    // reads ENGAGED.
+    expect(run.state()['wheel.turn']).toBe(11.9);
+    expect(3.7 + (11.9 - 3.7)).toBe(11.899999999999999);
+    expect(Math.floor(11.899999999999999 / 1.7)).toBe(6);
+    // And so a further sweep moves it by nothing at all.
+    run.move('ring', { to: 200, duration: 0.25 });
+    run.advance();
+    expect(run.state()['wheel.turn']).toBe(11.9);
+  });
+
+  it('5.2 applies the landing after the SEGMENT pass too -- the place a '
+     + 'later stretch cannot quietly put right', () => {
+    const program = bench({
+      coordinates: {
+        ring: input(0), 'shaft.turn': coordinate(0),
+        'wheel.turn': coordinate(3.7),
+      },
+      edges: [
+        { kind: 'wiring', needs: ['ring'], gives: ['shaft.turn'],
+          description: 'ring drives shaft.turn', stated_by: 'Bench',
+          factor: 1.0 },
+        LOSSY_EDGE,
+      ],
+      // A shaft the RING drives, bounded, and reaching its bound AFTER
+      // the dial has landed: the stop blocks the ring for the rest of
+      // the tick, so the segment's landing is what the tick commits and
+      // no later stretch can land it a second time.
+      spans: { 'shaft.turn': { low: null, high: 60.0 } },
+      sources: {
+        ring: ['ring'], 'shaft.turn': ['ring'], 'wheel.turn': ['ring'],
+      },
+    });
+    const run = new Run(program, 0.25, 400);
+    const command = run.move('ring', { to: 100, duration: 0.25 });
+    run.advance();
+    expect(run.stops().map((one) => one.coordinate)).toEqual(['shaft.turn']);
+    expect(run.stops()[0].t).toBeCloseTo(0.6, 12);
+    expect(run.stops()[0].inputs).toEqual(['ring']);
+    expect(run.state()['shaft.turn']).toBe(60);
+    expect(command.status).toBe('blocked');
+    expect(run.state()['wheel.turn']).toBe(11.9);
+  });
+
+  it('5.3 a tick that fails AFTER a cut commits nothing -- not the '
+     + 'landing, not the crossing, not the bank', () => {
+    const program = bench({
+      coordinates: {
+        setter: input(0), ring: input(0), 'wheel.turn': coordinate(108),
+      },
+      edges: [
+        CLEARING_EDGE,
+        // A second law determining the same coordinate, disagreeing.
+        law(['setter'], ['wheel.turn'], '(setter * 7.0)',
+            'a second opinion about wheel.turn'),
+      ],
+      sources: {
+        setter: ['setter'], ring: ['ring'], 'wheel.turn': ['ring', 'setter'],
+      },
+    });
+    const run = new Run(program, 0.25, 400);
+    const command = run.move('ring', { to: 600, duration: 0.25 });
+    expect(() => run.advance()).toThrow(/wheel\.turn/);
+    expect(run.state()['wheel.turn']).toBe(108);
+    expect(run.state().ring).toBe(0);
+    expect(run.tick()).toBe(0);
+    expect(run.crossings()).toEqual([]);
+    expect(run.stops()).toEqual([]);
+    expect(command.status).toBe('refused');
+  });
+
+  it('5.3 `refusalKind` maps the landing invariant to its own kind, not '
+     + 'to a broken STOP invariant', () => {
+    expect(refusalKind(new LandingInvariantError('nowhere'))).toBe('landing');
+    expect(refusalKind(new StopInvariantError('runaway'))).toBe('stop');
+  });
+
+  it('5.4 a self-read crossing is recorded as a CROSSING and never as a '
+     + 'stop, and stops no input', () => {
+    const run = clearingRun();
+    const command = run.move('ring', { by: 600, duration: 0.25 });
+    for (let tick = 0; tick < 8; tick += 1) run.advance();
+    expect(run.stops()).toEqual([]);
+    expect(command.status).toBe('completed');
+    const mine = run.crossings().filter(
+      (one) => one.coordinate === 'wheel.turn');
+    expect(mine.length).toBeGreaterThan(0);
+    for (const one of mine) {
+      expect(one.relation)
+        .toBe('(setter, ring, wheel.turn) drives wheel.turn');
+      expect(['floor', '==', '>=']).toContain(one.primitive);
+      expect(one.t).toBeGreaterThanOrEqual(0);
+      expect(one.t).toBeLessThanOrEqual(1);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------
+// A BLOCK in the run (design D4, D6, tasks 8-9). The documents are the
+// framework's own, out of the conformance corpus: the numbers below are
+// the producer's and are never recomputed a second way here.
+// ---------------------------------------------------------------------
+
+/** One corpus machine's published document, by name, with the bank's
+ * rest values optionally overridden -- `Sim(klass, state={...})`. */
+function corpusRun(name: string, dt: number,
+                   state: Record<string, number> = {}): Run {
+  const found = (corpus as unknown as {
+    machines: { name: string; document: unknown }[];
+  }).machines.find((one) => one.name === name)!;
+  const document = JSON.parse(JSON.stringify(found.document));
+  for (const [id, value] of Object.entries(state)) {
+    document.program.coordinates[id].initial = value;
+    if (document.drivers[id] !== undefined) {
+      document.drivers[id].default = value;
+    }
+  }
+  return new Run(loadProgram(document as RunDocument, `corpus://${name}`),
+                 dt, 16);
+}
+
+describe('a block in the run (design D4, D6, tasks 8-9)', () => {
+  it('9.2 the selected machine equals its FROZEN TWIN: `ShiftedCarry` '
+     + 'cranked by 2.0 over 12 ticks of dt = 1/12', () => {
+    // The producer's own numbers for THIS document, measured at
+    // machinome `0b0f02a`:
+    //   Sim(ShiftedCarry(), dt=1/12, state={'shift': s});
+    //   move('crank', by=2.0, duration=1.0); run(1/12) x 12
+    //   s = 0 -> carry.travel 1.0, crank 2.0, higher.turn 1.5,
+    //            lower.turn 2.0
+    //   s = 1 -> carry.travel 1.0, crank 2.0, higher.turn 2.0,
+    //            lower.turn 0.0
+    // The selected machine is its frozen twin: at position 0 the lever
+    // is what advances the higher wheel, and it does so for three
+    // quarters of the crank's travel; at position 1 the crank turns the
+    // higher wheel itself and the lower one does not move at all.
+    for (const [shift, expected] of [
+      [0, { 'lower.turn': 2.0, 'higher.turn': 1.5, 'carry.travel': 1.0 }],
+      [1, { 'lower.turn': 0.0, 'higher.turn': 2.0, 'carry.travel': 1.0 }],
+    ] as [number, Record<string, number>][]) {
+      const run = corpusRun('ShiftedCarry', 1 / 12, { shift });
+      run.move('crank', { by: 2, duration: 1.0 });
+      for (let tick = 0; tick < 12; tick += 1) run.advance();
+      const state = run.state();
+      expect(state.shift).toBe(shift);
+      expect(state.crank).toBe(2);
+      for (const [id, value] of Object.entries(expected)) {
+        expect(state[id]).toBe(value);
+      }
+    }
+  });
+
+  it('9.3 a SELECTION CHANGE ALONE moves nothing -- exactly the number '
+     + 'zero, bit for bit', () => {
+    const run = corpusRun('ShiftedCarry', 0.05);
+    run.move('crank', { by: 2, duration: 0.2 });
+    for (let tick = 0; tick < 8; tick += 1) run.advance();
+    const before = { ...run.state() };
+    // The carriage alone, across its detent and back.
+    run.move('shift', { by: 1, duration: 0.2 });
+    for (let tick = 0; tick < 8; tick += 1) run.advance();
+    run.move('shift', { by: -1, duration: 0.2 });
+    for (let tick = 0; tick < 8; tick += 1) run.advance();
+    const after = run.state();
+    for (const id of ['lower.turn', 'higher.turn', 'carry.travel']) {
+      expect(Object.is(after[id], before[id])).toBe(true);
+    }
+  });
+
+  it('8.2 `affine` is FALSE on every give of a block, so a stop on one of '
+     + 'its coordinates is SEARCHED: `RangedBlock`\'s own numbers', () => {
+    const run = corpusRun('RangedBlock', 0.05);
+    const spin = run.move('spin', { by: 2, duration: 0.05 });
+    run.move('shift', { by: 1, duration: 0.05 });
+    run.advance();
+    // The producer's floats, which the piecewise path -- taken because
+    // the MEMBER publishes `affine: [true]` -- commits as 0.6 and 0.3.
+    const stops = run.stops();
+    expect(stops).toHaveLength(1);
+    expect(stops[0].coordinate).toBe('carry.travel');
+    expect(stops[0].t).toBe(0.29999999999972715);
+    expect(stops[0].inputs).toEqual(['spin']);
+    expect(run.state()['lower.turn']).toBe(0.5999999999994543);
+    expect(run.state().spin).toBe(0.5999999999994543);
+    expect(spin.status).toBe('blocked');
+    expect(spin.admitted).toBe(0.5999999999994543);
+    // And the determination really is the block, with `affine` false.
+    const program = (run as unknown as { program: LoadedProgram }).program;
+    const where = program.determiner.get('carry.travel')!;
+    expect(where.edge.kind).toBe('block');
+    expect(where.edge.affine[where.index]).toBe(false);
+  });
+
+  it('8.4 an input reaching a stopped block coordinate only through an '
+     + 'INACTIVE selection is not stopped and completes its whole '
+     + 'travel, while the pushing input retires blocked', () => {
+    // The carriage stands ABOVE the detent, where the lever reads the
+    // HIGHER wheel, and the lever is already at its bound.
+    const run = corpusRun('RangedBlock', 0.05,
+                          { shift: 1, 'carry.travel': 0.6 });
+    // `spin` reaches the lever only through `lower.turn`, which the
+    // selection has switched out: it is not stopped by it.
+    const spin = run.move('spin', { by: 2, duration: 0.05 });
+    run.advance();
+    expect(spin.status).toBe('completed');
+    expect(run.state().spin).toBe(2);
+    expect(run.state()['lower.turn']).toBe(2);
+    expect(run.state()['carry.travel']).toBe(0.6);
+    expect(run.stops()).toEqual([]);
+
+    // `crank` reaches it through the term the selection leaves ACTIVE,
+    // so it is stopped at once and retires blocked with nothing
+    // admitted.
+    const crank = run.move('crank', { by: 1, duration: 0.05 });
+    run.advance();
+    expect(crank.status).toBe('blocked');
+    expect(crank.admitted).toBe(0);
+    expect(run.stops().map((one) => one.inputs)).toEqual([['crank']]);
+    expect(run.state()['carry.travel']).toBe(0.6);
+  });
+});
+
+// ---------------------------------------------------------------------
+// A STOP ON A KINKED DETERMINER (openspec `solve-at-the-kink`, design
+// §6 case A, tasks 5.1). The corpus's own `KinkedStop`, asserted as an
+// IDENTITY and not within the corpus's comparison window: the producer
+// SOLVES this stop at its own kink, and so must this viewer.
+//
+// The law carries no jump node at all -- `4 + 72 * clamp01((lever -
+// 113.5) / 11.25)` -- so `edgeCuts` returned `[]` for it and `locate`
+// took the one-division fast path STRAIGHT THROUGH the kink. The trap
+// that path falls into is a NUMBER: over the whole tick the coordinate
+// runs 4 -> 76, so one division puts the stop at (40 - 4) / 72 = 0.5,
+// where the coordinate reaches 40 at t = 0.478125 and is standing on
+// its flat piece for the first 0.3375 of the tick. The base did not
+// give 0.5 -- it SEARCHED, and landed 9.09e-14 out.
+// ---------------------------------------------------------------------
+
+describe('a stop on a kinked determiner (design D4 (c))', () => {
+  it('5.1 lands on the producer\'s own fraction EXACTLY', () => {
+    const run = corpusRun('KinkedStop', 0.1);
+    const command = run.move('lever', { by: 40, duration: 0.1 });
+    run.advance();
+    const stops = run.stops();
+    expect(stops).toHaveLength(1);
+    expect(stops[0].coordinate).toBe('slide.travel');
+    // The producer's own recorded floats, bit for bit.
+    expect(stops[0].t).toBe(0.478125);
+    expect(run.state()['slide.travel']).toBe(40);
+    expect(run.state().lever).toBe(119.125);
+    expect(command.admitted).toBe(19.125);
+    expect(command.status).toBe('blocked');
+    // ... and NOT the fraction a single division over the whole tick
+    // gives.
+    expect(stops[0].t).not.toBe(0.5);
+  });
+
+  /** A clamp with no jump node at all: `clamp(crank, 0, 100)`, bounded
+   * at 40. */
+  const clamped = (crank: number, travel: number) => bench({
+    coordinates: { crank: input(crank), 'wheel.turn': coordinate(travel) },
+    edges: [law(['crank'], ['wheel.turn'], 'min(max(crank, 0.0), 100.0)',
+                'crank drives wheel', false)],
+    spans: { 'wheel.turn': { low: null, high: 40 } },
+  });
+
+  it('5.2 brackets the bound between two BREAKPOINTS and divides', () => {
+    // The path starts on the clamp's FLAT piece and reaches the bound on
+    // the sloped one: `crank` runs -10 -> 50, so the coordinate holds at
+    // 10 until the clamp opens at `t = 10/60` and then runs to 60. A
+    // single division over the whole tick would put the stop at
+    // (40 - 10) / 50 = 0.6, where the coordinate is still at 34.
+    const run = new Run(clamped(-10, 10), 0.05, 64);
+    const command = run.move('crank', { by: 60, duration: 0.05 });
+    run.advance();
+    expect(run.state()['wheel.turn']).toBe(40);
+    // The closed form of the fixture's own arithmetic: the breakpoint
+    // where the clamp opens, and one division inside the piece that
+    // brackets the bound.
+    const opens = (0 - -10) / (50 - -10);
+    const expected = opens + (1 - opens) * (40 - 10) / (60 - 10);
+    expect(run.stops()[0].t).toBe(expected);
+    expect(run.stops()[0].t).toBeCloseTo(40 / 60, 12);
+    expect(run.stops()[0].t).not.toBe(0.6);
+    expect(command.admitted).toBe(60 * expected);
+  });
+
+  it('5.5 leaves a stop on a BLOCK coordinate SEARCHED', () => {
+    // A block has no single published expression until a branch vector
+    // is fixed, and the order its members run in may differ from piece
+    // to piece, so it carries no shape at all and `locate` searches it
+    // exactly as before. The corpus's own `RangedBlock` is the entry
+    // that records it.
+    const run = corpusRun('RangedBlock', 0.05);
+    const block = [...run.program.edges].find(
+      (edge) => edge.kind === 'block')!;
+    expect(block.shapes.every((shape) => shape === null)).toBe(true);
+    expect(block.affine.every((flag) => flag === false)).toBe(true);
+  });
+
+  it('5.3 leaves the ONE-DIVISION fast path alone where the tick reaches '
+     + 'no kink: empty cuts means affine over the whole tick', () => {
+    // The same law driven entirely inside the sloped piece: the path IS
+    // affine over the tick, so there are no breakpoints at all and the
+    // stop is the single exact division `locate` has always taken.
+    const run = new Run(clamped(10, 10), 0.05, 64);
+    const command = run.move('crank', { by: 40, duration: 0.05 });
+    run.advance();
+    expect(run.state()['wheel.turn']).toBe(40);
+    expect(run.stops()[0].t).toBe((40 - 10) / 40);
+    expect(command.admitted).toBe(30);
+  });
+});

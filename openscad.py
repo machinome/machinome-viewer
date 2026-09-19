@@ -1,4 +1,4 @@
-# solid-node-viewer - the browser viewer for solid-node models
+# machinome-viewer - the browser viewer for machinome models
 # Copyright (C) 2023-2026 Luis Henrique Cassis Fagundes
 # SPDX-License-Identifier: AGPL-3.0-only
 
@@ -11,8 +11,8 @@ import sys
 import errno
 from subprocess import Popen
 
-from solid_node.core import load_node
-from solid_node.openscad import require_openscad
+from machinome.core import load_node
+from machinome.openscad import require_openscad
 
 
 logger = logging.getLogger('viewers.openscad')
