@@ -11,7 +11,7 @@ browser. You need no Python, Node.js, framework installation or CAD backend.
 **Working on a Machinome model:** install the viewer into the Python environment
 that runs the framework. Machinome owns modeling, builds and file watching;
 the viewer displays the result. See the framework's
-`quick start <https://machinome.readthedocs.io/en/latest/quickstart.html>`_
+`installation page <https://machinome.readthedocs.io/en/latest/start/install.html>`_
 for the matching framework and CAD setup.
 
 **Building an embedding host:** obtain ``machinome-viewer.js`` from an installed
@@ -19,31 +19,42 @@ package or a framework export, then follow :doc:`embedding`. There is no
 separately published npm package to install; the browser bundle travels with
 the Python distribution.
 
-Install the current source version
-==================================
+Install the released package
+============================
 
-Version |package-version| is not yet published on PyPI. Do not expect a
-``pip install machinome-viewer==0.2.0`` command to obtain this checkout.
-From an available checkout of ``machinome-viewer``, with **Python 3.11+** and
-**Node.js 22+**:
+Version |package-version| releases with Machinome 0.7.0. The framework's
+``viewer`` extra installs both into one environment, with **Python 3.11+**:
 
 .. code-block:: console
 
    python -m venv .venv
    . .venv/bin/activate
+   python -m pip install "machinome[viewer]"
+   machinome-viewer describe
+
+If you already have a framework environment, activate that environment instead
+of creating a second one. The final command reports the installed bundle paths,
+package version, API version, and supported document versions as JSON. Built
+wheels and source distributions carry the bundle: **installing a distribution
+needs no npm**. ``python -m pip install machinome-viewer`` installs the viewer
+alone, for a host that only serves or captures published documents.
+
+Build from source
+=================
+
+To work on the viewer itself, or to run a checkout that is ahead of the
+release, build the bundle before installing, with **Node.js 22+**:
+
+.. code-block:: console
+
    npm ci --prefix machinome_viewer/widget
    npm run build --prefix machinome_viewer/widget
    python -m pip install -e .
    machinome-viewer describe
 
-If you already have a framework environment, activate that environment instead
-of creating a second one. The final command reports the installed bundle paths,
-package version, API version, and supported document versions as JSON.
-
-Once distributions are published, the intended maker installation is
-``python -m pip install "machinome[viewer]"``. Built wheels and source
-distributions carry the bundle: **installing a distribution needs no npm**.
-Node is needed when building frontend source, not for ordinary viewing.
+Node is needed when building frontend source, not for ordinary viewing. A
+source checkout rebuilds a stale bundle on lookup when its build tools are
+present, and never installs npm dependencies for you.
 
 Open a project
 ==============
