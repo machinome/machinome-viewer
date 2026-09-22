@@ -14,30 +14,14 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: solid_node_viewer/widget/package-lock.json
-      - working-directory: solid_node_viewer/widget
+          cache-dependency-path: machinome_viewer/widget/package-lock.json
+      - working-directory: machinome_viewer/widget
         run: npm ci
-      - working-directory: solid_node_viewer/widget
+      - working-directory: machinome_viewer/widget
         run: npm run typecheck
-      - working-directory: solid_node_viewer/widget
+      - working-directory: machinome_viewer/widget
         run: npm test
-      - working-directory: solid_node_viewer/widget
-        run: npm run build
-
-  app:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: solid_node_viewer/app/package-lock.json
-      - working-directory: solid_node_viewer/app
-        run: npm ci
-      - working-directory: solid_node_viewer/app
-        run: CI=true npm test -- --watchAll=false
-      - working-directory: solid_node_viewer/app
+      - working-directory: machinome_viewer/widget
         run: npm run build
 
   python:
@@ -48,17 +32,16 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: |
-            solid_node_viewer/widget/package-lock.json
-            solid_node_viewer/app/package-lock.json
+          cache-dependency-path: machinome_viewer/widget/package-lock.json
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-      - name: Build the frontends the suite photographs
+      - name: Build the widget the suite photographs
+        working-directory: machinome_viewer/widget
         run: |
-          (cd solid_node_viewer/widget && npm ci && npm run build)
-          (cd solid_node_viewer/app && npm ci && npm run build)
+          npm ci
+          npm run build
       - name: Install the package with its browser
         run: |
           pip install -e ".[dev]"
@@ -67,7 +50,7 @@ jobs:
 
   dist:
     runs-on: ubuntu-latest
-    needs: [widget, app, python]
+    needs: [widget, python]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
