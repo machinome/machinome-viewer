@@ -1,0 +1,26 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "Machinome Viewer",
+  "description": "The browser viewer for Machinome models: an embeddable three.js widget, portable exports, a development server and headless snapshots.",
+  "folders": [],
+  "excludeFolders": [
+    "openspec",
+    "workflow",
+    "tests",
+    "web",
+    "build",
+    "dist",
+    "docs/_build",
+    "machinome_viewer/widget/node_modules",
+    "machinome_viewer/widget/dist"
+  ],
+  "excludeFiles": [],
+  "rules": [
+    "machinome-viewer 0.7.0 releases with Machinome 0.7.0 and is numbered with it. It declares viewer API 23 and reads document versions 1-10.",
+    "Install it with the framework: pip install \"machinome[viewer]\". The widget is not published on npm; it ships inside the Python distribution. The Python package needs Python 3.11+.",
+    "Embed an exported page in an iframe, or load machinome-viewer.js and call MachinomeViewer.mount(target, documentUrl, options). mountInspector() adds a collapsible assembly sidebar.",
+    "The process interface is machinome-viewer describe|serve|capture (also python -m machinome_viewer). The machinome.viewer entry point provides only the bundle lookup.",
+    "The viewer and the framework never import each other; serving and capture run as separate processes.",
+    "The package and its browser bundle are AGPL-3.0-only; the Machinome framework is Apache-2.0."
+  ]
+}
