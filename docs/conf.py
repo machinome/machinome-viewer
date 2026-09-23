@@ -25,7 +25,6 @@ nitpicky = True
 highlight_language = "javascript"
 rst_prolog = (
     f".. |package-version| replace:: {release}\n"
-    ".. |released-viewer-api| replace:: 26\n"
     f".. |viewer-api| replace:: {widget['machinomeViewerApi']}\n"
     ".. |document-versions| replace:: "
     + ", ".join(map(str, widget["machinomeDocumentVersions"])) + "\n"

@@ -16,7 +16,7 @@
   ],
   "excludeFiles": [],
   "rules": [
-    "machinome-viewer 0.7.0 releases with Machinome 0.7.0 and is numbered with it. It declares viewer API 26 and reads document versions 1-13; new running exports declare version 11 (source-timed motion), 12 when they carry a Follow relation between two moving surfaces, or 13 when a running bound reads finite convex-profile contact, and an older viewer refuses them.",
+    "machinome-viewer 0.7.0 releases with Machinome 0.7.0 and is numbered with it. It declares viewer API 27 and reads document versions 1-13; new running exports declare version 11 (source-timed motion), 12 when they carry a Follow relation between two moving surfaces, or 13 when a running bound reads finite convex-profile contact, and an older viewer refuses them. API 27 gives two Turn controls on one part that select different joints separately named drag handles; API 26 refuses that pair at load.",
     "Install it with the framework: pip install \"machinome[viewer]\". The widget is not published on npm; it ships inside the Python distribution. The Python package needs Python 3.11+.",
     "Embed an exported page in an iframe, or load machinome-viewer.js and call MachinomeViewer.mount(target, documentUrl, options). mountInspector() adds a collapsible assembly sidebar.",
     "The process interface is machinome-viewer describe|serve|capture (also python -m machinome_viewer). The machinome.viewer entry point provides only the bundle lookup.",
