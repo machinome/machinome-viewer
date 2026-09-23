@@ -28,6 +28,8 @@ rst_prolog = (
     f".. |viewer-api| replace:: {widget['machinomeViewerApi']}\n"
     ".. |document-versions| replace:: "
     + ", ".join(map(str, widget["machinomeDocumentVersions"])) + "\n"
+    ".. |baseline-viewer-api| replace:: 25\n"
+    ".. |baseline-document-versions| replace:: 1 through 12\n"
 )
 
 html_theme = "sphinx_rtd_theme"
