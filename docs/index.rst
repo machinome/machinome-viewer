@@ -58,7 +58,7 @@ One viewer, several homes
 
 The same bundle powers the development page, portable export page, custom
 embeds, and headless capture. The Python package provides the development
-server and capture command. It is **AGPL-3.0-only**, separate from the
+server and capture command. It is **AGPL-3.0-or-later**, separate from the
 Apache-2.0 Machinome framework, which reaches it through a small lookup and
 separate processes. Neither package imports the other's runtime.
 

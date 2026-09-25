@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # machinome-viewer - the browser viewer for machinome models
 # Copyright (C) 2023-2026 Luis Henrique Cassis Fagundes
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # The release dry-run: build the source distribution and the wheel, install
 # the wheel into a throwaway environment outside the repository, and ask the
@@ -34,7 +34,7 @@ assert os.path.isfile(value['path']), value
 assert os.path.isfile(value['index']), value
 assert isinstance(value['apiVersion'], int), value
 head = open(value['path']).read(600)
-assert 'AGPL-3.0-only' in head and 'Source:' in head, head
+assert 'AGPL-3.0-or-later' in head and 'Source:' in head, head
 print(f"check-dist: wheel installs clean and carries the bundle "
       f"(API {value['apiVersion']}, version {value['version']}).")
 PY
