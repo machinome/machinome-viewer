@@ -18,7 +18,7 @@ backend to display and operate an export.
 
    This manual describes Machinome Viewer |package-version|, released on
    27 September 2026 together with Machinome 0.7.1 and numbered with it. It
-   declares viewer API |viewer-api| and reads document versions
+   declares viewer API 27 and reads document versions
    |document-versions|. :doc:`installation` installs both packages at once.
 
 Start here
