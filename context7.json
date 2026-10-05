@@ -16,11 +16,12 @@
   ],
   "excludeFiles": [],
   "rules": [
-    "machinome-viewer 0.7.1 releases with Machinome 0.7.1 and is numbered with it; it is the published 0.7.0 renumbered, with no change to the widget, the server or the capture. It declares viewer API 27 and reads document versions 1-13; new running exports declare version 11 (source-timed motion), 12 when they carry a Follow relation between two moving surfaces, or 13 when a running bound reads finite convex-profile contact, and an older viewer refuses them. API 27 gives two Turn controls on one part that select different joints separately named drag handles; API 26 refuses that pair at load.",
+    "machinome-viewer 0.8.0 releases with Machinome 0.8.0 and is numbered with it. It declares viewer API 29 and reads document versions 1-13; a 0.7 viewer reads a 0.8 export and this viewer reads every 0.7 export. API 28 adds partOnScreen(path) and project(world), which give the screen position of any part and any world point, highlight(paths, options), which tints named parts and keeps, dims or ghosts the rest, and an optional up and fov on setView(), which view() reports; API 29 lets renderMode 'on-demand' mount a clocked machine posed by request and drawn without a frame loop. A bundle reporting API 27 has none of these, and one reporting 28 refuses the on-demand clocked mount.",
+    "New running exports declare version 11 (source-timed motion), 12 when they carry a Follow relation between two moving surfaces, or 13 when a running bound reads finite convex-profile contact, and an older viewer refuses them. API 27 gives two Turn controls on one part that select different joints separately named drag handles; API 26 refuses that pair at load.",
     "Install it with the framework: pip install \"machinome[viewer]\". The widget is not published on npm; it ships inside the Python distribution. The Python package needs Python 3.11+.",
     "Embed an exported page in an iframe, or load machinome-viewer.js and call MachinomeViewer.mount(target, documentUrl, options). mountInspector() adds a collapsible assembly sidebar.",
     "The process interface is machinome-viewer describe|serve|capture (also python -m machinome_viewer). The machinome.viewer entry point provides only the bundle lookup.",
     "The viewer and the framework never import each other; serving and capture run as separate processes.",
-    "The package and its browser bundle are AGPL-3.0-or-later; the Machinome framework is Apache-2.0."
+    "The package and its browser bundle are AGPL-3.0-or-later; the Machinome framework is licensed separately, as its own manual states."
   ]
 }

@@ -17,8 +17,8 @@ backend to display and operate an export.
 .. note::
 
    This manual describes Machinome Viewer |package-version|, released on
-   27 September 2026 together with Machinome 0.7.1 and numbered with it. It
-   declares viewer API 27 and reads document versions
+   5 October 2026 together with Machinome 0.8.0 and numbered with it. It
+   declares viewer API |viewer-api| and reads document versions
    |document-versions|. :doc:`installation` installs both packages at once.
 
 Start here
@@ -58,9 +58,10 @@ One viewer, several homes
 
 The same bundle powers the development page, portable export page, custom
 embeds, and headless capture. The Python package provides the development
-server and capture command. It is **AGPL-3.0-or-later**, separate from the
-Apache-2.0 Machinome framework, which reaches it through a small lookup and
-separate processes. Neither package imports the other's runtime.
+server and capture command. It is **AGPL-3.0-or-later**. The Machinome
+framework is a separate package, licensed separately (its own manual states
+its licence); it reaches the viewer through a small lookup and separate
+processes. Neither package imports the other's runtime.
 
 .. toctree::
    :maxdepth: 1
