@@ -22,7 +22,7 @@ the Python distribution.
 Install the released package
 ============================
 
-Version |package-version| releases with Machinome 0.8.0. The framework's
+Version |package-version| releases with Machinome 0.8.1. The framework's
 ``viewer`` extra installs both into one environment, with **Python 3.11+**:
 
 .. code-block:: console
